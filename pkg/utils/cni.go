@@ -178,7 +178,7 @@ func (c *CNINetworkConfig) WriteCNIConfig() error {
 		}
 	}
 
-	err = os.WriteFile(c.filePath, cniBytes, 0644)
+	err = WriteFileAtomically(c.filePath, cniBytes, 0644)
 	if err != nil {
 		return fmt.Errorf("failed to write into CNI conf file: %w", err)
 	}
