@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"syscall"
 
 	"golang.org/x/sys/unix"
@@ -26,81 +27,401 @@ import (
 // atomic replacement semantics. However, this makes it fail in cases where
 // os.WriteFile succeeds:
 //
-//   - If the process can't create files in target's parent directory, e.g
+//   - If the process can't create files in target's parent directory, e.g.
 //     because the target directory is read-only.
 //
 // On the contrary, this function succeeds in cases where os.WriteFile fails:
 //
-//   - If target exists and is non-writable, i.e. if its permissions don't have
-//     the appropriate write bit set.
+//   - This function can follow symlink chains that are longer than the OS's
+//     limit for a single path-based syscall.
 //
 // Atomic replacement applies to regular target files only. Non-regular existing
 // targets follow os.WriteFile semantics because they don't have replaceable
 // file contents.
-func WriteFileAtomically(target string, content []byte, mode os.FileMode) (err error) {
-	// Open the parent directory, respecting symlinks.
-	dir, base, err := openParentDir(target)
-	if err != nil {
-		return err
-	}
-	defer func() { err = errors.Join(err, dir.Close()) }()
+//
+// If a symlink would have to be followed in a sticky, world-writable directory,
+// but the symlink is owned by neither the directory owner nor the user running
+// the process. This mirrors the kernel's fs.protected_symlinks policy, and is
+// applied even on systems where that policy is disabled.
+func WriteFileAtomically(path string, content []byte, mode os.FileMode) error {
+	_, err := writeFileAtomically(path, content, mode)
+	return err
+}
 
-	switch base {
+func writeFileAtomically(path string, content []byte, mode os.FileMode) (bool, error) {
+	entry, err := openDirEntry(path)
+	if err != nil {
+		return false, err
+	}
+	defer func() { err = errors.Join(err, entry.close()) }()
+
+	if err := entry.evalSymlinks(); err != nil {
+		if e, ok := errors.AsType[badSymlinkError](err); ok {
+			return false, &os.PathError{Op: "open", Path: path, Err: syscall.Errno(e)}
+		}
+		return false, err
+	}
+
+	if entry.canWriteAtomically() {
+		return true, entry.writeAtomically(content, mode)
+	}
+
+	return false, entry.writeDirect(content)
+}
+
+type dirEntry struct {
+	f    *os.File
+	name string
+	info os.FileInfo
+	dir  *os.File
+}
+
+func (e *dirEntry) path() string {
+	if e.f != nil {
+		return e.f.Name()
+	}
+
+	return e.relativePath(e.name)
+}
+
+func (e *dirEntry) relativePath(name string) string {
+	if e.dir == nil {
+		return name
+	}
+
+	if dir := e.dir.Name(); dir == "" {
+		return name
+	} else if os.IsPathSeparator(dir[len(dir)-1]) {
+		return dir + name
+	} else {
+		return dir + string(os.PathSeparator) + name
+	}
+}
+
+func (e *dirEntry) dirFD() int {
+	if e.dir == nil {
+		return unix.AT_FDCWD
+	}
+	return int(e.dir.Fd())
+}
+
+func (e *dirEntry) close() error {
+	if e.dir == nil {
+		if e.f == nil {
+			return nil
+		}
+		return e.f.Close()
+	}
+
+	derr := e.dir.Close()
+
+	if e.f != nil {
+		if ferr := e.f.Close(); ferr != nil {
+			return errors.Join(derr, ferr)
+		}
+	}
+
+	return derr
+}
+
+func openDirEntry(path string) (_ *dirEntry, err error) {
+	dir, name := filepath.Split(path)
+
+	var entry dirEntry
+	if dirFD, err := entry.unixOpenAt(cmp.Or(dir, "."), unix.O_DIRECTORY, 0); err != nil {
+		if err != unix.ENOENT {
+			path = cmp.Or(dir, ".")
+		}
+		return nil, &os.PathError{Op: "open", Path: path, Err: err}
+	} else {
+		entry.dir, entry.name = os.NewFile(uintptr(dirFD), dir), name
+	}
+	defer func() {
+		if err != nil {
+			err = errors.Join(err, entry.close())
+		}
+	}()
+
+	err = syscall.EISDIR
+	switch name {
 	case "":
-		var err error = syscall.EISDIR
-		if dir.Name() == "" {
+		if dir == "" {
 			err = os.ErrNotExist
 		}
-		return &os.PathError{Op: "open", Path: dir.Name(), Err: err}
+		fallthrough
 	case ".", "..":
-		return &os.PathError{Op: "open", Path: dir.Name() + base, Err: syscall.EISDIR}
+		return nil, &os.PathError{Op: "open", Path: path, Err: err}
+	default:
 	}
 
-	// Open a pre-existing target, if any.
-	var stat unix.Stat_t
-	preExisting, err := ignoringEINTR(func() (int, error) {
-		return unix.Openat(int(dir.Fd()), base, unix.O_PATH|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
-	})
-	if err != nil {
-		if err != unix.ENOENT {
-			return &os.PathError{Op: "open", Path: filepath.Join(dir.Name(), base), Err: err}
-		}
-	} else {
-		defer unix.Close(preExisting)
+	if err := entry.setTarget(name); err != nil {
+		return nil, err
+	}
 
-		// Record the pre-existing target's attributes.
-		stat, err = ignoringEINTR(func() (stat unix.Stat_t, _ error) {
-			err := unix.Fstat(preExisting, &stat)
+	return &entry, nil
+}
+
+func (e *dirEntry) openAt(name string, flags int, mode os.FileMode) (*os.File, error) {
+	path := e.relativePath(name)
+	fd, err := e.unixOpenAt(name, flags, mode)
+	if err != nil {
+		return nil, &os.PathError{Op: "open", Path: path, Err: err}
+	}
+
+	return os.NewFile(uintptr(fd), path), nil
+}
+
+func (e *dirEntry) unixOpenAt(name string, flags int, mode os.FileMode) (_ int, err error) {
+	unixMode := uint32(mode & 0777)
+	if mode&os.ModeSetuid != 0 {
+		unixMode |= unix.S_ISUID
+	}
+	if mode&os.ModeSetgid != 0 {
+		unixMode |= unix.S_ISGID
+	}
+	if mode&os.ModeSticky != 0 {
+		unixMode |= unix.S_ISVTX
+	}
+
+	fd, err := ignoringEINTR(func() (int, error) {
+		return unix.Openat(e.dirFD(), name, flags|unix.O_CLOEXEC, unixMode)
+	})
+	runtime.KeepAlive(e.dir)
+	return fd, err
+}
+
+func (e *dirEntry) onDifferentMountPoint() bool {
+	for _, mask := range []uint32{unix.STATX_MNT_ID_UNIQUE, unix.STATX_MNT_ID} {
+		dirStat, err := ignoringEINTR(func() (stat unix.Statx_t, _ error) {
+			err := unix.Statx(int(e.dir.Fd()), "", unix.AT_EMPTY_PATH, int(mask), &stat)
+			return stat, err
+		})
+		runtime.KeepAlive(e.dir)
+		if err != nil {
+			if err == unix.ENOSYS {
+				break
+			}
+			return false
+		}
+		if dirStat.Mask&mask != mask {
+			continue
+		}
+
+		targetStat, err := ignoringEINTR(func() (stat unix.Statx_t, _ error) {
+			err := unix.Statx(int(e.f.Fd()), "", unix.AT_EMPTY_PATH, int(mask), &stat)
 			return stat, err
 		})
 		if err != nil {
-			return &os.PathError{Op: "stat", Path: filepath.Join(dir.Name(), base), Err: err}
+			if err == unix.ENOSYS {
+				break
+			}
+			return false
+		}
+		if targetStat.Mask&mask != mask {
+			continue
 		}
 
-		// If it's an irregular target, try to write directly to it.
-		if stat.Mode&unix.S_IFMT != unix.S_IFREG {
-			mode := stat.Mode & (0777 | unix.S_ISUID | unix.S_ISGID | unix.S_ISVTX)
-			return writeFileDirect(preExisting, dir, base, content, mode)
+		return dirStat.Mnt_id != targetStat.Mnt_id
+	}
+
+	if dirStat, err := e.dir.Stat(); err == nil {
+		if dirStat, ok := dirStat.Sys().(*syscall.Stat_t); ok {
+			if targetStat, ok := e.info.Sys().(*syscall.Stat_t); ok {
+				return dirStat.Dev != targetStat.Dev
+			}
 		}
+	}
+
+	return false
+}
+
+func (e *dirEntry) setTarget(name string) error {
+	f, err := e.openAt(name, unix.O_PATH|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			f, e.name, e.f, e.info = e.f, name, nil, nil
+			if f == nil {
+				return nil
+			}
+			return f.Close()
+		}
+		return err
+	}
+
+	info, err := f.Stat()
+	if err != nil {
+		return errors.Join(err, f.Close())
+	}
+
+	e.name, e.f, e.info, f = name, f, info, e.f
+	if f == nil {
+		return nil
+	}
+	return f.Close()
+}
+
+type badSymlinkError syscall.Errno
+
+func (e badSymlinkError) Error() string { return syscall.Errno(e).Error() }
+
+func (e *dirEntry) evalSymlinks() error {
+	const (
+		// Give up following symlinks after 40 hops.
+		// This is the same as the MAXSYMLINKS constant in the kernel.
+		maxSymlinkHops = 40
+
+		// Maximum path name length including the terminal NUL.
+		maxPath = 4096
+	)
+
+	var pathBuf [maxPath]byte
+	for symlinkHops := 0; ; {
+		if ok, err := e.isSymlink(); err != nil {
+			return err
+		} else if !ok {
+			return nil
+		}
+
+		linkLen, err := ignoringEINTR(func() (int, error) {
+			return unix.Readlinkat(int(e.f.Fd()), "", pathBuf[:])
+		})
+		if err != nil {
+			return &os.PathError{Op: "open", Path: e.f.Name(), Err: err}
+		}
+
+		symlinkHops++
+		if symlinkHops > maxSymlinkHops {
+			return &os.PathError{Op: "open", Path: e.f.Name(), Err: badSymlinkError(syscall.ELOOP)}
+		}
+		if linkLen == len(pathBuf) {
+			return &os.PathError{Op: "readlink", Path: e.f.Name(), Err: errors.New("link name too long")}
+		}
+
+		resolved := string(pathBuf[:linkLen])
+
+		if filepath.IsAbs(resolved) {
+			other, err := openDirEntry(resolved)
+			if err != nil {
+				return err
+			}
+			err = e.close()
+			*e = *other
+			return err
+		}
+
+		dir, name := filepath.Split(resolved)
+		if dir != "" {
+			newDir, err := e.openAt(dir, unix.O_DIRECTORY, 0)
+			if err != nil {
+				return err
+			}
+			if err, e.dir = e.dir.Close(), newDir; err != nil {
+				return err
+			}
+		}
+		if err := e.setTarget(name); err != nil {
+			return err
+		}
+	}
+}
+
+func (e *dirEntry) isSymlink() (bool, error) {
+	if e.f == nil || e.info.Mode()&os.ModeSymlink == 0 {
+		return false, nil
+	}
+
+	dirStat, err := e.dir.Stat()
+	if err != nil {
+		return false, err
+	}
+
+	// https://www.kernel.org/doc/html/latest/admin-guide/sysctl/fs.html#protected-symlinks
+	const stickyWorldWritable = os.ModeSticky | 0002
+	if dirStat.Mode()&stickyWorldWritable == stickyWorldWritable {
+		if dirStat, ok := dirStat.Sys().(*syscall.Stat_t); ok {
+			if targetStat, ok := e.info.Sys().(*syscall.Stat_t); ok &&
+				targetStat.Uid != dirStat.Uid && targetStat.Uid != uint32(syscall.Geteuid()) {
+				return false, badSymlinkError(syscall.EACCES)
+			}
+		}
+	}
+
+	return true, nil
+}
+
+func (e *dirEntry) canWriteAtomically() bool {
+	if e.f == nil {
+		return true
+	}
+	if !e.info.Mode().IsRegular() {
+		return false
+	}
+
+	if e.onDifferentMountPoint() {
+		return false
+	}
+
+	// Don't try atomic writes if the target is on another device.
+	if stat, ok := e.info.Sys().(*syscall.Stat_t); ok {
+		if dirInfo, err := e.dir.Stat(); err == nil {
+			if dirStat, ok := dirInfo.Sys().(*syscall.Stat_t); ok {
+				return stat.Dev == dirStat.Dev
+			}
+		}
+	}
+
+	return true
+}
+
+func (e *dirEntry) writeDirect(content []byte) error {
+	// First, try to re-open the existing file descriptor for writing.
+	procFDPath := fmt.Sprintf("/proc/self/fd/%d", e.f.Fd())
+	f, err := os.OpenFile(procFDPath, syscall.O_WRONLY|syscall.O_TRUNC, 0)
+	runtime.KeepAlive(e)
+	if err == nil {
+		normalize := func(err error) error {
+			if err, ok := errors.AsType[*os.PathError](err); ok && err.Path == procFDPath {
+				err.Path = e.path()
+			}
+			return err
+		}
+
+		_, err := f.Write(content)
+		return errors.Join(normalize(err), normalize(f.Close()))
+	}
+
+	// If that failed, try to open it via its path name. This is not completely
+	// TOCTOU free, but since this is a traditional direct write, it's at least
+	// not too concerning if target became a traditional file in the meantime.
+	// The atomic semantics got lost, but other than that, it behaves just like
+	// os.WriteFile.
+	flags := unix.O_WRONLY | unix.O_CREAT | unix.O_TRUNC | unix.O_NOFOLLOW
+	fd, err := e.unixOpenAt(e.name, flags, e.info.Mode())
+	if err != nil {
+		return &os.PathError{Op: "open", Path: e.path(), Err: err}
+	}
+
+	// Set the file descriptor to non-blocking after opening it, so opening it
+	// properly blocks on sockets and FIFOs. This is what os.OpenFile would do,
+	// too.
+	_ = syscall.SetNonblock(fd, true)
+	f = os.NewFile(uintptr(fd), e.path())
+
+	_, err = f.Write(content)
+	return errors.Join(err, f.Close())
+}
+
+func (e *dirEntry) writeAtomically(content []byte, mode os.FileMode) (err error) {
+	if err := e.openForWriteOK(); err != nil {
+		return err
 	}
 
 	// Open the temporary file to write to.
-	tmpMode := os.FileMode(0600)
-	if preExisting == -1 {
-		// Create the temporary file with the desired target permissions. This
-		// means that the intended audience of the target path can read and
-		// potentially write to it. Since this is clearly a temporary file and
-		// the focus of this function is the target path rather than any
-		// intermediary temporary paths, this trade-off is acceptable to
-		// preserve the umask for newly created files.
-		tmpMode = mode & (os.ModePerm | os.ModeSetuid | os.ModeSetgid | os.ModeSticky)
-		// The user write bit is required to read extended attributes.
-		tmpMode |= 0200
-	}
-	tmp, err := createTemp(dir, base, tmpMode)
+	tmp, err := e.createTemporaryFile(mode)
 	if err != nil {
 		return err
 	}
+	_, tmpName := filepath.Split(tmp.Name())
 
 	// Defer closing the temporary file and removing it on errors.
 	defer func() {
@@ -109,12 +430,12 @@ func WriteFileAtomically(target string, content []byte, mode os.FileMode) (err e
 			// Sync the directory, so that the rename is committed to disk. The
 			// renamed file is already visible to other processes; a failed sync
 			// only means that the replacement might not survive a system crash.
-			_ = dir.Sync()
+			_ = e.dir.Sync()
 			return
 		}
 
 		_, removeErr := ignoringEINTR(func() (unit struct{}, _ error) {
-			err := unix.Unlinkat(int(dir.Fd()), tmp.Name(), 0)
+			err := unix.Unlinkat(int(e.dir.Fd()), tmpName, 0)
 			return unit, err
 		})
 		if removeErr != nil {
@@ -123,7 +444,7 @@ func WriteFileAtomically(target string, content []byte, mode os.FileMode) (err e
 			} else {
 				removeErr = &os.PathError{
 					Op:   "remove",
-					Path: filepath.Join(dir.Name(), tmp.Name()),
+					Path: e.relativePath(tmp.Name()),
 					Err:  removeErr,
 				}
 			}
@@ -142,170 +463,75 @@ func WriteFileAtomically(target string, content []byte, mode os.FileMode) (err e
 	}
 
 	// Preserve file attributes, if possible.
-	if preExisting != -1 {
-		// Copy over extended attributes on a best-effort basis.
-		// Re-open the file descriptor with read permissions.
-		if f, err := os.Open(fmt.Sprintf("/proc/self/fd/%d", preExisting)); err == nil {
-			defer f.Close()
-			copyXAttrs(int(f.Fd()), int(tmp.Fd()))
-		}
-
-		_ = tmp.Chown(int(stat.Uid), int(stat.Gid))
-
-		mode := os.FileMode(stat.Mode & 0777)
-		if stat.Mode&unix.S_ISUID != 0 {
-			mode |= os.ModeSetuid
-		}
-		if stat.Mode&unix.S_ISGID != 0 {
-			mode |= os.ModeSetgid
-		}
-		if stat.Mode&unix.S_ISVTX != 0 {
-			mode |= os.ModeSticky
-		}
-		if err := tmp.Chmod(mode); err != nil {
-			return err
-		}
-	} else if mode&0200 == 0 {
-		// Strip the write bit.
-		// Re-stat to get the current mode after umask.
-		stat, err := tmp.Stat()
-		if err != nil {
-			return err
-		}
-		// Do a chmod only if the write bit needs to be stripped.
-		if mode := stat.Mode(); mode&0200 != 0 {
-			if err := tmp.Chmod(mode &^ 0200); err != nil {
-				return err
-			}
-		}
+	if err := e.preserveAttributes(tmp, mode); err != nil {
+		return err
 	}
 
 	// Do the actual rename.
+	dirFD := e.dirFD()
 	if _, err := ignoringEINTR(func() (unit struct{}, _ error) {
-		err := unix.Renameat(int(dir.Fd()), tmp.Name(), int(dir.Fd()), base)
+		err := unix.Renameat(dirFD, tmpName, dirFD, e.name)
 		return unit, err
 	}); err != nil {
-		return &os.LinkError{
-			Op:  "rename",
-			Old: dir.Name() + tmp.Name(),
-			New: dir.Name() + base,
-			Err: err,
-		}
+		return &os.LinkError{Op: "rename", Old: tmp.Name(), New: e.path(), Err: err}
 	}
 
 	return nil
 }
 
-// Resolves symbolic links in target, including a trailing chain of dangling
-// symlinks, i.e. the result may be a non-existing path at which a new file
-// would be created.
-func openParentDir(target string) (_ *os.File, _ string, err error) {
-	const (
-		// Give up following symlinks after 40 hops.
-		// This is the same as the MAXSYMLINKS constant in the kernel.
-		maxSymlinkHops = 40
-
-		// Maximum path name length including the terminal NUL.
-		maxPath = 4096
-	)
-
-	parent, base := filepath.Split(target)
-	dir, err := openDir(nil, parent)
-	if err != nil {
-		return nil, "", err
+func (e *dirEntry) openForWriteOK() error {
+	if e.f == nil {
+		return nil
 	}
-	defer func() {
-		if err != nil && dir != nil {
-			err = errors.Join(err, dir.Close())
-		}
-	}()
-
-	var pathBuf [maxPath]byte
-	for symlinkHops := 0; ; {
-		if base == "" {
-			return dir, base, nil
-		}
-		linkLen, err := ignoringEINTR(func() (int, error) {
-			return unix.Readlinkat(int(dir.Fd()), base, pathBuf[:])
-		})
-		if err != nil {
-			if err == unix.ENOENT {
-				return dir, base, nil
-			}
-			if err == unix.EINVAL {
-				// The target path exists, but is not a symlink.
-				return dir, base, nil
-			}
-			return nil, "", &os.PathError{Op: "readlink", Path: dir.Name() + base, Err: err}
-		}
-		symlinkHops++
-		if symlinkHops > maxSymlinkHops {
-			return nil, "", errors.New("too many links")
-		}
-		if linkLen == len(pathBuf) {
-			return nil, "", &os.PathError{
-				Op:   "readlink",
-				Path: dir.Name() + base,
-				Err:  errors.New("link name too long"),
-			}
-		}
-
-		resolved := string(pathBuf[:linkLen])
-		parent, base = filepath.Split(resolved)
-		if parent != "" {
-			newDir, err := openDir(dir, parent)
-			if err != nil {
-				return nil, "", err
-			}
-			if err, dir = dir.Close(), newDir; err != nil {
-				return nil, "", err
-			}
-		}
-	}
-}
-
-func openDir(dir *os.File, target string) (*os.File, error) {
-	dirfd, path := unix.AT_FDCWD, target
-	if dir == nil {
-		target = cmp.Or(target, ".")
-	} else {
-		dirfd = int(dir.Fd())
-		if !filepath.IsAbs(target) {
-			path = dir.Name() + target
-		}
-	}
-
-	fd, err := ignoringEINTR(func() (int, error) {
-		return unix.Openat(dirfd, target, unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	_, err := ignoringEINTR(func() (unit struct{}, _ error) {
+		err := unix.Faccessat(int(e.f.Fd()), "", unix.W_OK, unix.AT_EMPTY_PATH|unix.AT_SYMLINK_NOFOLLOW)
+		return unit, err
 	})
-	runtime.KeepAlive(dir)
+	if err == unix.EINVAL {
+		// Need to fallback to a TOCTOU check. On older kernels that don't have
+		// faccessat2, Go's stdlib emulates it, just like glibc does. However,
+		// for some unclear reason, it won't emulate AT_EMPTY_PATH, although it
+		// seems to be straight forward at first glance. Anyhow, it's completely
+		// out of scope to copy over the stdlib's emulation code here, hence
+		// fallback to re-stat via path:
+		_, err = ignoringEINTR(func() (unit struct{}, _ error) {
+			err := unix.Faccessat(int(e.dir.Fd()), e.name, unix.W_OK, unix.AT_SYMLINK_NOFOLLOW)
+			return unit, err
+		})
+	}
 	if err != nil {
-		return nil, &os.PathError{Op: "open", Path: path, Err: err}
+		op := "access"
+		if err == unix.EACCES {
+			op = "open"
+		}
+		return &os.PathError{Op: op, Path: e.f.Name(), Err: err}
 	}
 
-	return os.NewFile(uintptr(fd), path), nil
+	return nil
 }
 
-func createTemp(dir *os.File, name string, mode os.FileMode) (*os.File, error) {
+func (e *dirEntry) createTemporaryFile(mode os.FileMode) (*os.File, error) {
 	// The number of attempts to find an unused temporary file name.
 	// This mirrors the retry limit of os.CreateTemp.
 	const maxTempFileAttempts = 10000
 
-	flags := unix.O_WRONLY | unix.O_CREAT | unix.O_EXCL | unix.O_NONBLOCK | unix.O_CLOEXEC
-	unixMode := uint32(mode & 0777)
-	if mode&os.ModeSetuid != 0 {
-		unixMode |= unix.S_ISUID
-	}
-	if mode&os.ModeSetgid != 0 {
-		unixMode |= unix.S_ISGID
-	}
-	if mode&os.ModeSticky != 0 {
-		unixMode |= unix.S_ISVTX
+	flags := unix.O_WRONLY | unix.O_CREAT | unix.O_EXCL | unix.O_NONBLOCK
+	tmpMode := os.FileMode(0600)
+	if e.f == nil {
+		// Create the temporary file with the desired target permissions. This
+		// means that the intended audience of the target path can read and
+		// potentially write to it. Since this is clearly a temporary file and
+		// the focus of this function is the target path rather than any
+		// intermediary temporary paths, this trade-off is acceptable to
+		// preserve the umask for newly created files.
+		tmpMode = mode & (os.ModePerm | os.ModeSetuid | os.ModeSetgid | os.ModeSticky)
+		// The user write bit is required to read extended attributes.
+		tmpMode |= 0200
 	}
 
-	for attempt := 1; ; attempt++ {
+	for attempt := range maxTempFileAttempts {
 		var rnd uint32
-		if attempt <= 3 {
+		if attempt < 3 {
 			rnd = mrand.Uint32() //nolint:gosec // Just try this the first three times.
 		} else {
 			var b [4]byte
@@ -314,63 +540,81 @@ func createTemp(dir *os.File, name string, mode os.FileMode) (*os.File, error) {
 			}
 			rnd = binary.NativeEndian.Uint32(b[:])
 		}
-		tmpName := fmt.Sprintf(".%s.%d.tmp", name, rnd)
 
-		fd, err := ignoringEINTR(func() (int, error) {
-			return unix.Openat(int(dir.Fd()), tmpName, flags, unixMode)
-		})
-		runtime.KeepAlive(dir)
-		if err != nil {
-			if attempt < maxTempFileAttempts && err == unix.EEXIST {
-				continue
-			}
-			return nil, &os.PathError{
-				Op:   "createtemp",
-				Path: filepath.Join(dir.Name(), fmt.Sprintf(".%s.*.tmp", name)),
-				Err:  err,
-			}
+		tmp, err := e.openAt(fmt.Sprintf(".%s.%d.tmp", e.name, rnd), flags, tmpMode)
+		if err == nil || !errors.Is(err, os.ErrExist) {
+			return tmp, err
 		}
+	}
 
-		return os.NewFile(uintptr(fd), tmpName), nil
+	return nil, &os.PathError{
+		Op:   "createtemp",
+		Path: e.relativePath(fmt.Sprintf(".%s.*.tmp", e.name)),
+		Err:  os.ErrExist,
 	}
 }
 
-func writeFileDirect(fd int, dir *os.File, base string, content []byte, mode uint32) error {
-	// First, try to re-open the existing file descriptor for writing.
-	path := filepath.Join(dir.Name(), base)
-	procFDPath := fmt.Sprintf("/proc/self/fd/%d", fd)
-	if f, err := os.OpenFile(procFDPath, syscall.O_WRONLY|syscall.O_TRUNC, 0); err == nil {
-		normalize := func(err error) error {
-			if err, ok := errors.AsType[*os.PathError](err); ok && err.Path == procFDPath {
-				err.Path = path
-			}
-			return err
+func (e *dirEntry) preserveAttributes(target *os.File, mode os.FileMode) error {
+	if e.f == nil {
+		if mode&0200 != 0 {
+			return nil
 		}
 
-		_, err := f.Write(content)
-		return errors.Join(normalize(err), normalize(f.Close()))
+		// Strip the write bit.
+		// Re-stat to get the current mode after umask.
+		stat, err := target.Stat()
+		if err != nil {
+			return err
+		}
+		// Do a chmod only if the write bit needs to be stripped.
+		if mode := stat.Mode(); mode&0200 != 0 {
+			if err := target.Chmod(mode &^ 0200); err != nil {
+				return err
+			}
+		}
+
+		return nil
 	}
 
-	// If that failed, try to open it via its path name. This is not completely
-	// TOCTOU free, but since this is now a traditional direct write, it's at
-	// least not too concerning if target became a traditional file in the
-	// meantime. The atomic semantics got lost, but other than that, it behaves
-	// just like os.WriteFile.
-	flags := unix.O_WRONLY | unix.O_CREAT | unix.O_TRUNC | unix.O_CLOEXEC
-	fd, err := ignoringEINTR(func() (int, error) {
-		return unix.Openat(int(dir.Fd()), base, flags, mode)
-	})
-	if err != nil {
-		return &os.PathError{Op: "open", Path: path, Err: err}
+	// Copy over extended attributes on a best-effort basis.
+	// Re-open the file descriptor with read permissions.
+	f, err := os.Open(fmt.Sprintf("/proc/self/fd/%d", e.f.Fd()))
+	runtime.KeepAlive(e.f)
+	if err == nil {
+		func() {
+			defer f.Close()
+			copyXAttrs(int(f.Fd()), int(target.Fd()))
+			runtime.KeepAlive(target)
+		}()
 	}
-	// Set the file descriptor to non-blocking after opening it, so opening it
-	// properly blocks on sockets and FIFOs. This is what os.OpenFile would do,
-	// too.
-	_ = syscall.SetNonblock(fd, true)
-	f := os.NewFile(uintptr(fd), path)
 
-	_, err = f.Write(content)
-	return errors.Join(err, f.Close())
+	if stat, ok := e.info.Sys().(*syscall.Stat_t); ok {
+		_ = target.Chown(int(stat.Uid), int(stat.Gid))
+	}
+
+	mode = e.info.Mode()
+
+	// https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/fs/attr.c?h=v7.1#n63
+	if mode&(os.ModeSetuid|os.ModeSetgid) != 0 {
+		if ok, err := hasEffectiveCap(unix.CAP_FSETID); err == nil && !ok {
+			mode &^= os.ModeSetuid
+
+			if mode&0010 != 0 {
+				mode &^= os.ModeSetgid
+			} else if stat, ok := e.info.Sys().(*syscall.Stat_t); ok && mode&os.ModeSetgid != 0 {
+				if int(stat.Gid) != unix.Getegid() {
+					panic("FIXME this is currently lacking test coverage.")
+					if groups, err := unix.Getgroups(); err == nil {
+						if !slices.Contains(groups, int(stat.Gid)) {
+							mode &^= os.ModeSetgid
+						}
+					}
+				}
+			}
+		}
+	}
+
+	return target.Chmod(mode)
 }
 
 func copyXAttrs(src, dst int) {
@@ -397,6 +641,23 @@ func copyXAttrs(src, dst int) {
 			})
 		}
 	}
+}
+
+func hasEffectiveCap(cap byte) (bool, error) {
+	const linuxCapabilityU32SizeVersion3 = 2 // _LINUX_CAPABILITY_U32S_3
+
+	pos, mask := cap/32, uint32(1)<<(cap%32)
+	if pos >= linuxCapabilityU32SizeVersion3 {
+		return false, nil
+	}
+
+	hdr := unix.CapUserHeader{Version: unix.LINUX_CAPABILITY_VERSION_3}
+	var data [linuxCapabilityU32SizeVersion3]unix.CapUserData
+	if err := unix.Capget(&hdr, &data[0]); err != nil {
+		return false, os.NewSyscallError("capget", err)
+	}
+
+	return data[pos].Effective&mask != 0, nil
 }
 
 func outBufferSyscall(f func([]byte) (int, error)) ([]byte, error) {

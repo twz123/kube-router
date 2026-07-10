@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -17,8 +18,31 @@ import (
 )
 
 func TestWriteFileAtomically(t *testing.T) {
+	expectAtomicWrite := func(t *testing.T, atomic bool, path string, content []byte, mode os.FileMode) error {
+		t.Helper()
+
+		if false { // FIXME
+			t.Log("Checking against os.WriteFile")
+			return os.WriteFile(path, content, mode)
+		}
+
+		actual, err := writeFileAtomically(path, content, mode)
+		if atomic {
+			assert.True(t, actual, "Expected an atomic write")
+		} else {
+			assert.False(t, actual, "Expected a direct write")
+		}
+
+		return err
+	}
+
+	hasCapSysAdmin, err := hasEffectiveCap(unix.CAP_SYS_ADMIN)
+	require.NoError(t, err)
+	hasCapChown, err := hasEffectiveCap(unix.CAP_CHOWN)
+	require.NoError(t, err)
+
 	t.Run("attributes", func(t *testing.T) {
-		for _, perm := range []os.FileMode{0400, 0477, 0755, 0644, 0777} {
+		for perm := range os.FileMode(01000) {
 			for _, specialBits := range []os.FileMode{0, os.ModeSetuid, os.ModeSetgid, os.ModeSticky} {
 				mode := perm | specialBits
 				t.Run(mode.String(), func(t *testing.T) {
@@ -33,7 +57,7 @@ func TestWriteFileAtomically(t *testing.T) {
 						require.NoError(t, err)
 						umask := 0777 &^ refStat.Mode()
 
-						require.NoError(t, WriteFileAtomically(target, nil, mode))
+						require.NoError(t, expectAtomicWrite(t, true, target, nil, mode))
 
 						if info, err := os.Stat(target); assert.NoError(t, err) {
 							if expected, actual := mode&^umask, info.Mode(); expected != actual {
@@ -52,8 +76,10 @@ func TestWriteFileAtomically(t *testing.T) {
 					})
 
 					t.Run("from pre-existing target", func(t *testing.T) {
+						// FIXME when executing as root, the user write bit is missing?!?
 						dir := t.TempDir()
 						target := filepath.Join(dir, "target")
+
 						attrValues := map[string][]byte{
 							"user.kube-router-test":       []byte(t.Name()),
 							"user.kube-router-test.empty": nil,
@@ -67,32 +93,53 @@ func TestWriteFileAtomically(t *testing.T) {
 							})
 							require.NoError(t, err)
 						}
-						require.NoError(t, os.Chmod(target, mode))
-						// Record the actual file info. Some file systems won't retain special bits.
-						info, err := os.Stat(target)
+						require.NoError(t, os.Chmod(target, mode|0200))
+						// Write a second time, to learn what mode bits are dropped by the kernel.
+						require.NoError(t, os.WriteFile(target, nil, 0))
+						// Record the actual file info as a result of open(..., O_WRONLY|O_TRUNC, ...).
+						info, err := os.Lstat(target)
 						require.NoError(t, err)
+						// Restore the mode to test.
+						require.NoError(t, os.Chmod(target, mode))
 
-						require.NoError(t, WriteFileAtomically(target, []byte(mode.String()), 0))
+						err = expectAtomicWrite(t, true, target, []byte(mode.String()), 0)
+						switch {
+						case mode&0200 == 0 && os.Geteuid() != 0:
+							var pathErr *os.PathError
+							require.ErrorAs(t, err, &pathErr)
+							assert.Equal(t, "open", pathErr.Op)
+							assert.Equal(t, target, pathErr.Path)
+							assert.ErrorIs(t, pathErr.Err, syscall.EACCES)
+							return
+						default:
+							require.NoError(t, err)
+						}
+
+						actualInfo, err := os.Lstat(target)
+						require.NoError(t, err)
+						if expected, actual := info.Mode(), actualInfo.Mode(); expected != actual {
+							assert.Failf(t, "Mode not equal", "expected: %s\nactual  : %s", expected, actual)
+						}
+						if actualInfo.Mode().Perm()&0400 == 0 {
+							require.NoError(t, os.Chmod(target, actualInfo.Mode()|0400), "Failed to restore permissions")
+						} else {
+							// FIXME: Only verify the extended attributes if the
+							// target file is readable. The process can't read
+							// them, so they can't be copied.
+							for attr, expected := range attrValues {
+								actual, err := outBufferSyscall(func(buf []byte) (int, error) {
+									return ignoringEINTR(func() (int, error) {
+										return unix.Getxattr(target, attr, buf)
+									})
+								})
+								if assert.NoErrorf(t, err, "While getting %s", attr) {
+									assert.Equalf(t, expected, actual, "While comparing %s", attr)
+								}
+							}
+						}
 
 						if content, err := readFileNoFollow(target); assert.NoError(t, err) {
 							assert.Equal(t, []byte(mode.String()), content)
-						}
-
-						if actualInfo, err := os.Stat(target); assert.NoError(t, err) {
-							if expected, actual := info.Mode(), actualInfo.Mode(); expected != actual {
-								assert.Failf(t, "Mode not equal", "expected: %s\nactual  : %s", expected, actual)
-							}
-						}
-
-						for attr, expected := range attrValues {
-							actual, err := outBufferSyscall(func(buf []byte) (int, error) {
-								return ignoringEINTR(func() (int, error) {
-									return unix.Getxattr(target, attr, buf)
-								})
-							})
-							if assert.NoErrorf(t, err, "While getting %s", attr) {
-								assert.Equalf(t, expected, actual, "While comparing %s", attr)
-							}
 						}
 					})
 				})
@@ -115,7 +162,7 @@ func TestWriteFileAtomically(t *testing.T) {
 			{"dot dot slash dot dot", "../..", syscall.EISDIR},
 		} {
 			t.Run(tt.name, func(t *testing.T) {
-				err := WriteFileAtomically(tt.path, nil, 0644)
+				err := expectAtomicWrite(t, false, tt.path, nil, 0644)
 				var pathErr *os.PathError
 				if assert.ErrorAs(t, err, &pathErr) {
 					assert.Equal(t, "open", pathErr.Op)
@@ -130,12 +177,13 @@ func TestWriteFileAtomically(t *testing.T) {
 		dir := t.TempDir()
 		target := filepath.Join(dir, "missing", "file")
 
-		err := WriteFileAtomically(target, nil, 0644)
+		err := expectAtomicWrite(t, false, target, nil, 0644)
 
 		var pathErr *os.PathError
 		if assert.ErrorAs(t, err, &pathErr) {
 			assert.Equal(t, "open", pathErr.Op)
-			assert.Equal(t, filepath.Clean(filepath.Dir(target)), filepath.Clean(pathErr.Path))
+			// assert.Equal(t, filepath.Clean(filepath.Dir(target)), filepath.Clean(pathErr.Path))
+			assert.Equal(t, target, pathErr.Path)
 			assert.ErrorIs(t, pathErr.Err, os.ErrNotExist)
 		}
 	})
@@ -147,7 +195,7 @@ func TestWriteFileAtomically(t *testing.T) {
 		// Obstruct the file path, so that the rename fails.
 		require.NoError(t, os.Mkdir(target, 0700))
 
-		err := WriteFileAtomically(target, nil, 0644)
+		err := expectAtomicWrite(t, false, target, nil, 0644)
 
 		var pathErr *os.PathError
 		if assert.ErrorAsf(t, err, &pathErr, "Expected a PathError: %v", err) {
@@ -174,7 +222,7 @@ func TestWriteFileAtomically(t *testing.T) {
 		require.NoError(t, os.Symlink("real", filepath.Join(dir, "intermediate")))
 		require.NoError(t, os.Symlink("intermediate", target))
 
-		require.NoError(t, WriteFileAtomically(target, []byte("new"), 0644))
+		require.NoError(t, expectAtomicWrite(t, true, target, []byte("new"), 0644))
 
 		if info, err := os.Lstat(target); assert.NoError(t, err) {
 			if mode := info.Mode(); mode&os.ModeSymlink == 0 {
@@ -197,7 +245,7 @@ func TestWriteFileAtomically(t *testing.T) {
 		require.NoError(t, os.Symlink(filepath.Join("..", "real"), filepath.Join(wd, "target")))
 		t.Chdir(wd)
 
-		require.NoError(t, WriteFileAtomically("target", []byte(t.Name()), 0644))
+		require.NoError(t, expectAtomicWrite(t, true, "target", []byte(t.Name()), 0644))
 
 		if info, err := os.Lstat(filepath.Join(wd, "target")); assert.NoError(t, err) {
 			if actual := info.Mode(); actual&os.ModeSymlink == 0 {
@@ -220,7 +268,7 @@ func TestWriteFileAtomically(t *testing.T) {
 		require.NoError(t, os.Symlink(filepath.Join("..", "x", "y"), filepath.Join(dir, "a", "s")))
 		require.NoError(t, os.Symlink(filepath.Join("..", "file"), filepath.Join(dir, "x", "y", "link")))
 
-		require.NoError(t, WriteFileAtomically(filepath.Join(dir, "a", "s", "link"), []byte(t.Name()), 0644))
+		require.NoError(t, expectAtomicWrite(t, true, filepath.Join(dir, "a", "s", "link"), []byte(t.Name()), 0644))
 
 		assert.NoFileExists(t, filepath.Join(dir, "a", "file"))
 		if content, err := readFileNoFollow(filepath.Join(dir, "x", "file")); assert.NoError(t, err) {
@@ -233,7 +281,7 @@ func TestWriteFileAtomically(t *testing.T) {
 		require.NoError(t, os.MkdirAll(filepath.Join(dir, "sub", "dir"), 0700))
 		require.NoError(t, os.Symlink(filepath.Join("sub", "dir", "file"), filepath.Join(dir, "target")))
 
-		require.NoError(t, WriteFileAtomically(filepath.Join(dir, "target"), []byte(t.Name()), 0644))
+		require.NoError(t, expectAtomicWrite(t, true, filepath.Join(dir, "target"), []byte(t.Name()), 0644))
 
 		if info, err := os.Lstat(filepath.Join(dir, "target")); assert.NoError(t, err) {
 			if actual := info.Mode(); actual&os.ModeSymlink == 0 {
@@ -249,7 +297,7 @@ func TestWriteFileAtomically(t *testing.T) {
 		here, elsewhere := t.TempDir(), t.TempDir()
 		require.NoError(t, os.Symlink(filepath.Join(elsewhere, "file"), filepath.Join(here, "target")))
 
-		require.NoError(t, WriteFileAtomically(filepath.Join(here, "target"), []byte(t.Name()), 0644))
+		require.NoError(t, expectAtomicWrite(t, true, filepath.Join(here, "target"), []byte(t.Name()), 0644))
 
 		if info, err := os.Lstat(filepath.Join(here, "target")); assert.NoError(t, err) {
 			if actual := info.Mode(); actual&os.ModeSymlink == 0 {
@@ -261,16 +309,70 @@ func TestWriteFileAtomically(t *testing.T) {
 		}
 	})
 
+	t.Run("protects symlinks in sticky directories", func(t *testing.T) {
+		t.Run("follows own symlinks", func(t *testing.T) {
+			dir := t.TempDir()
+			require.NoError(t, os.Chmod(dir, os.ModeSticky|0777))
+			require.NoError(t, os.Symlink("real", filepath.Join(dir, "target")))
+
+			require.NoError(t, expectAtomicWrite(t, true, filepath.Join(dir, "target"), []byte(t.Name()), 0644))
+
+			if content, err := readFileNoFollow(filepath.Join(dir, "real")); assert.NoError(t, err) {
+				assert.Equal(t, []byte(t.Name()), content)
+			}
+		})
+
+		t.Run("refuses to follow foreign symlinks", func(t *testing.T) {
+			const dirOwner, linkOwner = 65534, 65533
+
+			if !hasCapChown {
+				t.Skipf("Need CAP_CHOWN for this test.")
+			}
+
+			uid, _ := os.Geteuid(), os.Getegid()
+
+			dir := t.TempDir()
+			target := filepath.Join(dir, "target")
+			require.NoError(t, os.Chmod(dir, os.ModeSticky|0777))
+			require.NoError(t, os.Chown(dir, dirOwner, 0))
+
+			require.NoError(t, os.Symlink("real", target))
+			require.NoError(t, os.Lchown(target, linkOwner, 0))
+			t.Cleanup(func() { assert.NoError(t, os.Lchown(target, uid, 0)) })
+
+			err := expectAtomicWrite(t, false, target, []byte(t.Name()), 0644)
+
+			var pathErr *os.PathError
+			if assert.ErrorAsf(t, err, &pathErr, "Expected a PathError: %v", err) {
+				assert.Equal(t, "open", pathErr.Op)
+				assert.Equal(t, target, pathErr.Path)
+				assert.ErrorIsf(t, pathErr.Err, syscall.EACCES, "Expected syscall.EACCES: %v", pathErr.Err)
+			}
+			assert.NoFileExists(t, filepath.Join(dir, "real"))
+
+			// Symlinks owned by the directory owner are followed.
+			require.NoError(t, os.Lchown(target, dirOwner, dirOwner))
+			require.NoError(t, expectAtomicWrite(t, true, target, []byte(t.Name()), 0644))
+			if content, err := readFileNoFollow(filepath.Join(dir, "real")); assert.NoError(t, err) {
+				assert.Equal(t, []byte(t.Name()), content)
+			}
+		})
+	})
+
 	t.Run("too many symlinks", func(t *testing.T) {
 		dir := t.TempDir()
 		for i := 1; i <= 41; i++ {
 			require.NoError(t, os.Symlink("link-"+strconv.Itoa(i-1), filepath.Join(dir, "link-"+strconv.Itoa(i))))
 		}
 
-		err := WriteFileAtomically(filepath.Join(dir, "link-41"), nil, 0644)
-		require.EqualError(t, err, "too many links")
+		err := expectAtomicWrite(t, false, filepath.Join(dir, "link-41"), nil, 0644)
+		var pathErr *os.PathError
+		require.ErrorAs(t, err, &pathErr)
+		assert.Equal(t, "open", pathErr.Op)
+		assert.Equal(t, filepath.Join(dir, "link-41"), pathErr.Path)
+		assert.ErrorIs(t, pathErr.Err, syscall.ELOOP)
 
-		err = WriteFileAtomically(filepath.Join(dir, "link-40"), []byte("followed"), 0644)
+		err = expectAtomicWrite(t, true, filepath.Join(dir, "link-40"), []byte("followed"), 0644)
 		require.NoError(t, err)
 
 		content, err := readFileNoFollow(filepath.Join(dir, "link-0"))
@@ -308,7 +410,7 @@ func TestWriteFileAtomically(t *testing.T) {
 				}
 			}()
 
-			assert.NoError(t, WriteFileAtomically(fifo, []byte(t.Name()), 0644))
+			assert.NoError(t, expectAtomicWrite(t, false, fifo, []byte(t.Name()), 0644))
 		}()
 
 		select {
@@ -322,6 +424,99 @@ func TestWriteFileAtomically(t *testing.T) {
 
 		if info, err := os.Lstat(fifo); assert.NoError(t, err) {
 			assert.Equal(t, fifoInfo.Mode(), info.Mode(), "FIFO file mode changed unexpectedly")
+		}
+	})
+
+	t.Run("bind mounted target file", func(t *testing.T) {
+		if !hasCapSysAdmin {
+			t.Skipf("Need CAP_SYS_ADMIN for this test.")
+		}
+
+		dir := t.TempDir()
+		real := filepath.Join(dir, "real")
+		bound := filepath.Join(dir, "bound")
+
+		require.NoError(t, os.WriteFile(real, []byte("original"), 0644))
+		require.NoError(t, os.WriteFile(bound, []byte("shadowed"), 0644))
+
+		umount := sync.OnceValue(func() bool {
+			return assert.NoErrorf(t, unix.Unmount(bound, 0), "Failed to unmount %s", bound)
+		})
+		require.NoError(t, unix.Mount(real, bound, "", unix.MS_BIND, ""))
+		t.Cleanup(func() { umount() })
+
+		require.NoError(t, expectAtomicWrite(t, false, bound, []byte("replaced"), 0644))
+
+		if content, err := readFileNoFollow(bound); assert.NoError(t, err) {
+			assert.Equal(t, "replaced", string(content))
+		}
+
+		if umount() {
+			if content, err := readFileNoFollow(bound); assert.NoError(t, err) {
+				assert.Equal(t, "shadowed", string(content))
+			}
+		}
+	})
+
+	t.Run("bind mounted target symlink", func(t *testing.T) {
+		if !hasCapSysAdmin {
+			t.Skipf("Need CAP_SYS_ADMIN for this test.")
+		}
+
+		dir := t.TempDir()
+		require.NoError(t, os.MkdirAll(dir, 0777))
+		real := filepath.Join(dir, "real")
+		link := filepath.Join(dir, "link")
+		target := filepath.Join(dir, "target")
+
+		require.NoError(t, os.WriteFile(real, []byte("original"), 0644))
+		require.NoError(t, os.WriteFile(target, []byte("shadowed"), 0644))
+		require.NoError(t, os.Symlink("real", link))
+
+		umount := sync.OnceValue(func() bool {
+			err := unix.Unmount(target, unix.MNT_DETACH|unix.UMOUNT_NOFOLLOW)
+			return assert.NoErrorf(t, err, "Failed to unmount %s", target)
+		})
+		linkFD, err := unix.OpenTree(unix.AT_FDCWD, link, unix.AT_SYMLINK_NOFOLLOW|unix.OPEN_TREE_CLONE|unix.OPEN_TREE_CLOEXEC)
+		if errors.Is(err, errors.ErrUnsupported) {
+			t.Skipf("Can't bind mount symlinks on this kernel: %v", err)
+		}
+		require.NoError(t, err)
+
+		err = unix.MoveMount(linkFD, "", unix.AT_FDCWD, target, unix.MOVE_MOUNT_F_EMPTY_PATH)
+		assert.NoError(t, unix.Close(linkFD))
+		require.NoError(t, err)
+		t.Cleanup(func() { umount() })
+
+		for _, path := range []string{link, real, target} {
+			var stat unix.Statx_t
+			require.NoErrorf(
+				t, unix.Statx(unix.AT_FDCWD, path, unix.AT_SYMLINK_NOFOLLOW, unix.STATX_ALL, &stat),
+				"While stat'ing %s", filepath.Base(path),
+			)
+
+			t.Logf("%s mode:0%o symlink:%t", filepath.Base(path), stat.Mode, (stat.Mode&unix.S_IFMT) == unix.S_IFLNK)
+			if (stat.Mode & unix.S_IFMT) == unix.S_IFLNK {
+				target, err := os.Readlink(path)
+				require.NoErrorf(t, err, "Failed to readlink %s", filepath.Base(path))
+				t.Logf("target of %s: %s", filepath.Base(path), target)
+			}
+		}
+
+		require.NoError(t, expectAtomicWrite(t, true, target, []byte("replaced"), 0644))
+
+		if content, err := readFileNoFollow(real); assert.NoError(t, err) {
+			assert.Equal(t, "replaced", string(content))
+		}
+
+		linkTarget, err := os.Readlink(target)
+		require.NoError(t, err, "Expected target to remain a symlink")
+		require.Equal(t, "real", linkTarget, "Expected target to remain a symlink to real")
+
+		if umount() {
+			if content, err := readFileNoFollow(target); assert.NoError(t, err) {
+				assert.Equal(t, "shadowed", string(content))
+			}
 		}
 	})
 }
