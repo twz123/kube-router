@@ -17,32 +17,30 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// Writes content to target, making it appear atomically, i.e. other processes
+// Writes content to target, making it appear "atomically", i.e. other processes
 // won't observe a partially written target file. The owner, group, mode bits
 // and extended attributes are copied over from a pre-existing target, if it's a
 // regular file and this process has sufficient privileges. Otherwise the
 // provided mode bits are used (before umask).
 //
 // This is intended to be a drop-in replacement for [os.WriteFile], while adding
-// atomic replacement semantics. However, this makes it fail in cases where
-// os.WriteFile succeeds:
+// the semantics described above. However, there are some notable differences:
 //
-//   - If the process can't create files in target's parent directory, e.g.
-//     because the target directory is read-only.
-//
-// On the contrary, this function succeeds in cases where os.WriteFile fails:
-//
-//   - This function can follow symlink chains that are longer than the OS's
+//   - This function can follow symlink chains that are longer than the kernel's
 //     limit for a single path-based syscall.
+//   - This function fails if the process can't create files in target's parent
+//     directory, e.g. because the target directory is read-only.
+//   - On kernels that don't support the faccessat2 syscall, function may write
+//     to files that the kernel would otherwise reject.
+//   - If a symlink would have to be followed in a sticky, world-writable
+//     directory, but the symlink is owned by neither the directory owner nor
+//     the user running the process. This mirrors the kernel's
+//     fs.protected_symlinks policy, and is applied even on systems where that
+//     policy is disabled.
 //
 // Atomic replacement applies to regular target files only. Non-regular existing
 // targets follow os.WriteFile semantics because they don't have replaceable
 // file contents.
-//
-// If a symlink would have to be followed in a sticky, world-writable directory,
-// but the symlink is owned by neither the directory owner nor the user running
-// the process. This mirrors the kernel's fs.protected_symlinks policy, and is
-// applied even on systems where that policy is disabled.
 func WriteFileAtomically(path string, content []byte, mode os.FileMode) error {
 	_, err := writeFileAtomically(path, content, mode)
 	return err
@@ -483,31 +481,57 @@ func (e *dirEntry) openForWriteOK() error {
 	if e.f == nil {
 		return nil
 	}
-	_, err := ignoringEINTR(func() (unit struct{}, _ error) {
-		err := unix.Faccessat(int(e.f.Fd()), "", unix.W_OK, unix.AT_EMPTY_PATH|unix.AT_SYMLINK_NOFOLLOW)
-		return unit, err
-	})
-	if err == unix.EINVAL {
-		// Need to fallback to a TOCTOU check. On older kernels that don't have
-		// faccessat2, Go's stdlib emulates it, just like glibc does. However,
-		// for some unclear reason, it won't emulate AT_EMPTY_PATH, although it
-		// seems to be straight forward at first glance. Anyhow, it's completely
-		// out of scope to copy over the stdlib's emulation code here, hence
-		// fallback to re-stat via path:
-		_, err = ignoringEINTR(func() (unit struct{}, _ error) {
-			err := unix.Faccessat(int(e.dir.Fd()), e.name, unix.W_OK, unix.AT_SYMLINK_NOFOLLOW)
+
+	if false { // FIXME
+		if _, err := ignoringEINTR(func() (unit struct{}, _ error) {
+			err := unix.Faccessat2(int(e.f.Fd()), "", unix.W_OK, unix.AT_EACCESS|unix.AT_EMPTY_PATH|unix.AT_SYMLINK_NOFOLLOW)
 			return unit, err
-		})
-	}
-	if err != nil {
-		op := "access"
-		if err == unix.EACCES {
-			op = "open"
+		}); err == nil {
+			return nil
+		} else if err == unix.EACCES {
+			return &os.PathError{Op: "open", Path: e.f.Name(), Err: err}
+		} else if err != unix.ENOSYS {
+			return &os.PathError{Op: "faccessat2", Path: e.f.Name(), Err: err}
 		}
-		return &os.PathError{Op: op, Path: e.f.Name(), Err: err}
 	}
 
-	return nil
+	// Need to fallback to a userspace approximation for older kernels.
+
+	uid := os.Geteuid()
+	if uid == 0 {
+		// root can write to all files.
+		return nil
+	}
+	if ok, err := hasEffectiveCap(unix.CAP_DAC_OVERRIDE); err != nil || ok {
+		// Discretionary access control overridden.
+		return err
+	}
+
+	st, ok := e.info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return &os.PathError{Op: "faccessat2", Path: e.f.Name(), Err: unix.ENOSYS}
+	}
+
+	if uint32(uid) == st.Uid {
+		if st.Mode&unix.S_IWUSR != 0 {
+			return nil
+		}
+	} else if gid := os.Getegid(); uint32(gid) == st.Gid {
+		if st.Mode&unix.S_IWGRP != 0 {
+			panic("FIXME missing test coverage")
+			return nil
+		}
+	} else if gids, err := unix.Getgroups(); err != nil {
+		return os.NewSyscallError("getgroups", err)
+	} else if slices.Contains(gids, uid) {
+		panic("FIXME missing test coverage")
+		return nil
+	} else if st.Mode&unix.S_IWOTH != 0 {
+		panic("FIXME missing test coverage")
+		return nil
+	}
+
+	return &os.PathError{Op: "open", Path: e.f.Name(), Err: unix.EACCES}
 }
 
 func (e *dirEntry) createTemporaryFile(mode os.FileMode) (*os.File, error) {

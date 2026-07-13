@@ -3,6 +3,7 @@ package utils
 import (
 	"errors"
 	"io"
+	"iter"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -18,10 +19,15 @@ import (
 )
 
 func TestWriteFileAtomically(t *testing.T) {
+	// FIXME Tests definitely need to be run with different real and effective UIDs/GIDs.
+	// FIXME how does this interact with securebits, if at all?
+	// FIXME need to run against all permutations of +sys_admin,+dac_override,+chown,+fsetid.
+	// Need to vet this against man 7 capabilities
+
 	expectAtomicWrite := func(t *testing.T, atomic bool, path string, content []byte, mode os.FileMode) error {
 		t.Helper()
 
-		if false { // FIXME
+		if os.Getenv("__TEST_OS_WRITEFILE") == "1" {
 			t.Log("Checking against os.WriteFile")
 			return os.WriteFile(path, content, mode)
 		}
@@ -40,110 +46,122 @@ func TestWriteFileAtomically(t *testing.T) {
 	require.NoError(t, err)
 	hasCapChown, err := hasEffectiveCap(unix.CAP_CHOWN)
 	require.NoError(t, err)
+	hasCapDACOverride, err := hasEffectiveCap(unix.CAP_DAC_OVERRIDE)
+	require.NoError(t, err)
 
-	t.Run("attributes", func(t *testing.T) {
-		for perm := range os.FileMode(01000) {
-			for _, specialBits := range []os.FileMode{0, os.ModeSetuid, os.ModeSetgid, os.ModeSticky} {
-				mode := perm | specialBits
-				t.Run(mode.String(), func(t *testing.T) {
-					t.Run("from scratch", func(t *testing.T) {
-						dir := t.TempDir()
-						ref := filepath.Join(dir, "ref")
-						target := filepath.Join(dir, "target")
+	allGroups := []int{os.Getegid()}
+	suppGroups, err := os.Getgroups()
+	require.NoError(t, err)
+	allGroups = append(allGroups, suppGroups...)
 
-						// Record umask
-						require.NoError(t, os.WriteFile(ref, nil, 0777))
-						refStat, err := os.Stat(ref)
-						require.NoError(t, err)
-						umask := 0777 &^ refStat.Mode()
+	t.Run("from scratch", func(t *testing.T) {
+		for mode := range allModeBitPatterns() {
+			t.Run(mode.String(), func(t *testing.T) {
+				t.Parallel()
 
-						require.NoError(t, expectAtomicWrite(t, true, target, nil, mode))
+				dir := t.TempDir()
+				ref := filepath.Join(dir, "ref")
+				target := filepath.Join(dir, "target")
 
-						if info, err := os.Stat(target); assert.NoError(t, err) {
-							if expected, actual := mode&^umask, info.Mode(); expected != actual {
-								assert.Failf(t, "Mode not equal", "expected: %s\nactual  : %s", expected, actual)
-							}
-						}
+				// Record umask
+				require.NoError(t, os.WriteFile(ref, nil, 0777))
+				refStat, err := os.Stat(ref)
+				require.NoError(t, err)
+				umask := 0777 &^ refStat.Mode()
 
-						attrs, err := outBufferSyscall(func(buf []byte) (int, error) {
-							return ignoringEINTR(func() (int, error) {
-								return unix.Listxattr(target, buf)
-							})
-						})
-						if assert.NoError(t, err) {
-							assert.Len(t, attrs, 0)
-						}
-					})
+				require.NoError(t, expectAtomicWrite(t, true, target, nil, mode))
 
-					t.Run("from pre-existing target", func(t *testing.T) {
-						// FIXME when executing as root, the user write bit is missing?!?
-						dir := t.TempDir()
-						target := filepath.Join(dir, "target")
+				if info, err := os.Stat(target); assert.NoError(t, err) {
+					if expected, actual := mode&^umask, info.Mode(); expected != actual {
+						assert.Failf(t, "Mode not equal", "expected: %s\nactual  : %s", expected, actual)
+					}
+				}
 
-						attrValues := map[string][]byte{
-							"user.kube-router-test":       []byte(t.Name()),
-							"user.kube-router-test.empty": nil,
-						}
-
-						require.NoError(t, os.WriteFile(target, nil, 0600))
-						for attr, val := range attrValues {
-							_, err := ignoringEINTR(func() (unit struct{}, _ error) {
-								err := unix.Setxattr(target, attr, val, 0)
-								return unit, err
-							})
-							require.NoError(t, err)
-						}
-						require.NoError(t, os.Chmod(target, mode|0200))
-						// Write a second time, to learn what mode bits are dropped by the kernel.
-						require.NoError(t, os.WriteFile(target, nil, 0))
-						// Record the actual file info as a result of open(..., O_WRONLY|O_TRUNC, ...).
-						info, err := os.Lstat(target)
-						require.NoError(t, err)
-						// Restore the mode to test.
-						require.NoError(t, os.Chmod(target, mode))
-
-						err = expectAtomicWrite(t, true, target, []byte(mode.String()), 0)
-						switch {
-						case mode&0200 == 0 && os.Geteuid() != 0:
-							var pathErr *os.PathError
-							require.ErrorAs(t, err, &pathErr)
-							assert.Equal(t, "open", pathErr.Op)
-							assert.Equal(t, target, pathErr.Path)
-							assert.ErrorIs(t, pathErr.Err, syscall.EACCES)
-							return
-						default:
-							require.NoError(t, err)
-						}
-
-						actualInfo, err := os.Lstat(target)
-						require.NoError(t, err)
-						if expected, actual := info.Mode(), actualInfo.Mode(); expected != actual {
-							assert.Failf(t, "Mode not equal", "expected: %s\nactual  : %s", expected, actual)
-						}
-						if actualInfo.Mode().Perm()&0400 == 0 {
-							require.NoError(t, os.Chmod(target, actualInfo.Mode()|0400), "Failed to restore permissions")
-						} else {
-							// FIXME: Only verify the extended attributes if the
-							// target file is readable. The process can't read
-							// them, so they can't be copied.
-							for attr, expected := range attrValues {
-								actual, err := outBufferSyscall(func(buf []byte) (int, error) {
-									return ignoringEINTR(func() (int, error) {
-										return unix.Getxattr(target, attr, buf)
-									})
-								})
-								if assert.NoErrorf(t, err, "While getting %s", attr) {
-									assert.Equalf(t, expected, actual, "While comparing %s", attr)
-								}
-							}
-						}
-
-						if content, err := readFileNoFollow(target); assert.NoError(t, err) {
-							assert.Equal(t, []byte(mode.String()), content)
-						}
+				attrs, err := outBufferSyscall(func(buf []byte) (int, error) {
+					return ignoringEINTR(func() (int, error) {
+						return unix.Listxattr(target, buf)
 					})
 				})
-			}
+				if assert.NoError(t, err) {
+					assert.Len(t, attrs, 0)
+				}
+			})
+		}
+	})
+
+	t.Run("from pre-existing target", func(t *testing.T) {
+		for mode := range allModeBitPatterns() {
+			t.Run(mode.String(), func(t *testing.T) {
+				t.Parallel()
+				dir := t.TempDir()
+				target := filepath.Join(dir, "target")
+
+				attrValues := map[string][]byte{
+					"user.kube-router-test":       []byte(t.Name()),
+					"user.kube-router-test.empty": nil,
+				}
+
+				require.NoError(t, os.WriteFile(target, nil, 0600))
+				for attr, val := range attrValues {
+					_, err := ignoringEINTR(func() (unit struct{}, _ error) {
+						err := unix.Setxattr(target, attr, val, 0)
+						return unit, err
+					})
+					require.NoError(t, err)
+				}
+				require.NoError(t, os.Chmod(target, mode|0200))
+				// Write a second time, to learn what mode bits are dropped by the kernel.
+				require.NoError(t, os.WriteFile(target, nil, 0))
+				// Record the actual file info as a result of open(..., O_WRONLY|O_TRUNC, ...).
+				info, err := os.Lstat(target)
+				require.NoError(t, err)
+				// Restore the mode to test.
+				require.NoError(t, os.Chmod(target, mode))
+				expectedMode := info.Mode()
+				if mode&0200 == 0 {
+					expectedMode &^= 0200
+				}
+
+				ruid, euid := os.Getuid(), os.Geteuid()
+				_, _ = ruid, euid
+				err = expectAtomicWrite(t, true, target, []byte(mode.String()), 0)
+				if !hasCapDACOverride && mode&0200 == 0 {
+					var pathErr *os.PathError
+					require.ErrorAs(t, err, &pathErr)
+					assert.Equal(t, "open", pathErr.Op)
+					assert.Equal(t, target, pathErr.Path)
+					assert.ErrorIs(t, pathErr.Err, syscall.EACCES)
+					return
+				}
+				require.NoError(t, err)
+
+				actualInfo, err := os.Lstat(target)
+				require.NoError(t, err)
+				if actualMode := actualInfo.Mode(); expectedMode != actualMode {
+					assert.Failf(t, "Mode not equal", "expected: %s\nactual  : %s", expectedMode, actualMode)
+				}
+				if actualInfo.Mode().Perm()&0400 == 0 {
+					require.NoError(t, os.Chmod(target, actualInfo.Mode()|0400), "Failed to restore permissions")
+				} else {
+					// FIXME: Only verify the extended attributes if the
+					// target file is readable. The process can't read
+					// them, so they can't be copied.
+					for attr, expected := range attrValues {
+						actual, err := outBufferSyscall(func(buf []byte) (int, error) {
+							return ignoringEINTR(func() (int, error) {
+								return unix.Getxattr(target, attr, buf)
+							})
+						})
+						if assert.NoErrorf(t, err, "While getting %s", attr) {
+							assert.Equalf(t, expected, actual, "While comparing %s", attr)
+						}
+					}
+				}
+
+				if content, err := readFileNoFollow(target); assert.NoError(t, err) {
+					assert.Equal(t, []byte(mode.String()), content)
+				}
+			})
 		}
 	})
 
@@ -323,13 +341,19 @@ func TestWriteFileAtomically(t *testing.T) {
 		})
 
 		t.Run("refuses to follow foreign symlinks", func(t *testing.T) {
-			const dirOwner, linkOwner = 65534, 65533
-
 			if !hasCapChown {
 				t.Skipf("Need CAP_CHOWN for this test.")
 			}
 
-			uid, _ := os.Geteuid(), os.Getegid()
+			uid := os.Geteuid()
+
+			var dirOwner, linkOwner = 65534, 65533
+			if dirOwner == uid {
+				dirOwner--
+				linkOwner--
+			} else if linkOwner == uid {
+				linkOwner--
+			}
 
 			dir := t.TempDir()
 			target := filepath.Join(dir, "target")
@@ -445,10 +469,10 @@ func TestWriteFileAtomically(t *testing.T) {
 		require.NoError(t, unix.Mount(real, bound, "", unix.MS_BIND, ""))
 		t.Cleanup(func() { umount() })
 
-		require.NoError(t, expectAtomicWrite(t, false, bound, []byte("replaced"), 0644))
+		require.NoError(t, expectAtomicWrite(t, false, bound, []byte("written"), 0644))
 
 		if content, err := readFileNoFollow(bound); assert.NoError(t, err) {
-			assert.Equal(t, "replaced", string(content))
+			assert.Equal(t, "written", string(content))
 		}
 
 		if umount() {
@@ -503,10 +527,10 @@ func TestWriteFileAtomically(t *testing.T) {
 			}
 		}
 
-		require.NoError(t, expectAtomicWrite(t, true, target, []byte("replaced"), 0644))
+		require.NoError(t, expectAtomicWrite(t, true, target, []byte("written"), 0644))
 
 		if content, err := readFileNoFollow(real); assert.NoError(t, err) {
-			assert.Equal(t, "replaced", string(content))
+			assert.Equal(t, "written", string(content))
 		}
 
 		linkTarget, err := os.Readlink(target)
@@ -528,4 +552,22 @@ func readFileNoFollow(path string) (_ []byte, err error) {
 	}
 	defer func() { err = errors.Join(err, f.Close()) }()
 	return io.ReadAll(f)
+}
+
+func allModeBitPatterns() iter.Seq[os.FileMode] {
+	return func(yield func(os.FileMode) bool) {
+		for perm := range os.FileMode(01000) {
+			for _, specialBits := range []os.FileMode{
+				0, os.ModeSetuid, os.ModeSetgid, os.ModeSticky,
+				os.ModeSetuid | os.ModeSetgid,
+				os.ModeSetuid | os.ModeSticky,
+				os.ModeSetgid | os.ModeSticky,
+				os.ModeSetuid | os.ModeSetgid | os.ModeSticky,
+			} {
+				if !yield(perm | specialBits) {
+					return
+				}
+			}
+		}
+	}
 }
