@@ -49,7 +49,7 @@ func WriteFileAtomically(path string, content []byte, mode os.FileMode) error {
 func writeFileAtomically(path string, content []byte, mode os.FileMode) (bool, error) {
 	entry, err := openDirEntry(path)
 	if err != nil {
-		return false, err
+		return false, os.WriteFile(path, content, mode)
 	}
 	defer func() { err = errors.Join(err, entry.close()) }()
 
@@ -57,21 +57,33 @@ func writeFileAtomically(path string, content []byte, mode os.FileMode) (bool, e
 		if e, ok := errors.AsType[badSymlinkError](err); ok {
 			return false, &os.PathError{Op: "open", Path: path, Err: syscall.Errno(e)}
 		}
-		return false, err
+		return false, os.WriteFile(path, content, mode)
 	}
 
 	if entry.canWriteAtomically() {
-		return true, entry.writeAtomically(content, mode)
+		err := entry.writeAtomically(content, mode)
+		if pathErr, ok := errors.AsType[*os.PathError](err); ok {
+			if pathErr.Op == "createtemp" {
+				switch {
+				case errors.Is(err, unix.EACCES):
+					return false, entry.writeDirect(content, mode)
+				case errors.Is(err, unix.EROFS):
+					return false, entry.writeDirect(content, mode)
+				}
+			}
+		}
+
+		return true, err
 	}
 
-	return false, entry.writeDirect(content)
+	return false, entry.writeDirect(content, mode)
 }
 
 type dirEntry struct {
 	f    *os.File
 	name string
 	info os.FileInfo
-	dir  *os.File
+	dir  *os.File // TODO: Check if os.Root can be used here.
 }
 
 func (e *dirEntry) path() string {
@@ -126,11 +138,8 @@ func openDirEntry(path string) (_ *dirEntry, err error) {
 	dir, name := filepath.Split(path)
 
 	var entry dirEntry
-	if dirFD, err := entry.unixOpenAt(cmp.Or(dir, "."), unix.O_DIRECTORY, 0); err != nil {
-		if err != unix.ENOENT {
-			path = cmp.Or(dir, ".")
-		}
-		return nil, &os.PathError{Op: "open", Path: path, Err: err}
+	if dirFD, err := entry.unixOpenAt(cmp.Or(dir, "."), unix.O_PATH, 0); err != nil {
+		return nil, &os.PathError{Op: "open", Path: cmp.Or(dir, "."), Err: err}
 	} else {
 		entry.dir, entry.name = os.NewFile(uintptr(dirFD), dir), name
 	}
@@ -139,6 +148,11 @@ func openDirEntry(path string) (_ *dirEntry, err error) {
 			err = errors.Join(err, entry.close())
 		}
 	}()
+	if dirInfo, err := entry.dir.Stat(); err != nil {
+		return nil, err
+	} else if !dirInfo.IsDir() {
+		return nil, &os.PathError{Op: "open", Path: path, Err: syscall.ENOTDIR}
+	}
 
 	err = syscall.EISDIR
 	switch name {
@@ -371,7 +385,16 @@ func (e *dirEntry) canWriteAtomically() bool {
 	return true
 }
 
-func (e *dirEntry) writeDirect(content []byte) error {
+func (e *dirEntry) writeDirect(content []byte, mode os.FileMode) error {
+	if e.f == nil {
+		f, err := e.openAt(e.name, unix.O_WRONLY|unix.O_CREAT|unix.O_TRUNC, mode)
+		if err != nil {
+			return err
+		}
+		_, err = f.Write(content)
+		return errors.Join(err, f.Close())
+	}
+
 	// First, try to re-open the existing file descriptor for writing.
 	procFDPath := fmt.Sprintf("/proc/self/fd/%d", e.f.Fd())
 	f, err := os.OpenFile(procFDPath, syscall.O_WRONLY|syscall.O_TRUNC, 0)
@@ -482,7 +505,7 @@ func (e *dirEntry) openForWriteOK() error {
 		return nil
 	}
 
-	if false { // FIXME
+	if true { // FIXME
 		if _, err := ignoringEINTR(func() (unit struct{}, _ error) {
 			err := unix.Faccessat2(int(e.f.Fd()), "", unix.W_OK, unix.AT_EACCESS|unix.AT_EMPTY_PATH|unix.AT_SYMLINK_NOFOLLOW)
 			return unit, err
@@ -495,30 +518,41 @@ func (e *dirEntry) openForWriteOK() error {
 		}
 	}
 
-	// Need to fallback to a userspace approximation for older kernels.
+	err := statBasedOpenForWriteOK(func() (mode uint32, uid uint32, gid uint32, _ error) {
+		if st, ok := e.info.Sys().(*syscall.Stat_t); ok {
+			return st.Mode, st.Uid, st.Gid, nil
+		}
+		return 0, 0, 0, &os.PathError{Op: "faccessat2", Path: e.f.Name(), Err: unix.ENOSYS}
+	})
+	if err == unix.EACCES {
+		return &os.PathError{Op: "open", Path: e.f.Name(), Err: err}
+	}
+	return err
+}
 
+// Userspace approximation for older kernels based on stat'ing the path.
+func statBasedOpenForWriteOK(stat func() (mode, uid, gid uint32, _ error)) error {
 	uid := os.Geteuid()
 	if uid == 0 {
 		// root can write to all files.
 		return nil
 	}
-	if ok, err := hasEffectiveCap(unix.CAP_DAC_OVERRIDE); err != nil || ok {
+	if ok, err := capabilityInEffect(unix.CAP_DAC_OVERRIDE); err != nil || ok {
 		// Discretionary access control overridden.
 		return err
 	}
 
-	st, ok := e.info.Sys().(*syscall.Stat_t)
-	if !ok {
-		return &os.PathError{Op: "faccessat2", Path: e.f.Name(), Err: unix.ENOSYS}
+	mode, fuid, fgid, err := stat()
+	if err != nil {
+		return err
 	}
 
-	if uint32(uid) == st.Uid {
-		if st.Mode&unix.S_IWUSR != 0 {
+	if uint32(uid) == fuid {
+		if mode&unix.S_IWUSR != 0 {
 			return nil
 		}
-	} else if gid := os.Getegid(); uint32(gid) == st.Gid {
-		if st.Mode&unix.S_IWGRP != 0 {
-			panic("FIXME missing test coverage")
+	} else if gid := os.Getegid(); uint32(gid) == fgid {
+		if mode&unix.S_IWGRP != 0 {
 			return nil
 		}
 	} else if gids, err := unix.Getgroups(); err != nil {
@@ -526,12 +560,11 @@ func (e *dirEntry) openForWriteOK() error {
 	} else if slices.Contains(gids, uid) {
 		panic("FIXME missing test coverage")
 		return nil
-	} else if st.Mode&unix.S_IWOTH != 0 {
-		panic("FIXME missing test coverage")
+	} else if mode&unix.S_IWOTH != 0 {
 		return nil
 	}
 
-	return &os.PathError{Op: "open", Path: e.f.Name(), Err: unix.EACCES}
+	return unix.EACCES
 }
 
 func (e *dirEntry) createTemporaryFile(mode os.FileMode) (*os.File, error) {
@@ -567,6 +600,10 @@ func (e *dirEntry) createTemporaryFile(mode os.FileMode) (*os.File, error) {
 
 		tmp, err := e.openAt(fmt.Sprintf(".%s.%d.tmp", e.name, rnd), flags, tmpMode)
 		if err == nil || !errors.Is(err, os.ErrExist) {
+			if pathErr, ok := errors.AsType[*os.PathError](err); ok {
+				pathErr.Op = "createtemp"
+				pathErr.Path = fmt.Sprintf(".%s.*.tmp", e.name)
+			}
 			return tmp, err
 		}
 	}
@@ -612,15 +649,11 @@ func (e *dirEntry) preserveAttributes(target *os.File, mode os.FileMode) error {
 		}()
 	}
 
-	if stat, ok := e.info.Sys().(*syscall.Stat_t); ok {
-		_ = target.Chown(int(stat.Uid), int(stat.Gid))
-	}
-
 	mode = e.info.Mode()
 
 	// https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/fs/attr.c?h=v7.1#n63
 	if mode&(os.ModeSetuid|os.ModeSetgid) != 0 {
-		if ok, err := hasEffectiveCap(unix.CAP_FSETID); err == nil && !ok {
+		if ok, err := capabilityInEffect(unix.CAP_FSETID); err == nil && !ok {
 			mode &^= os.ModeSetuid
 
 			if mode&0010 != 0 {
@@ -638,7 +671,15 @@ func (e *dirEntry) preserveAttributes(target *os.File, mode os.FileMode) error {
 		}
 	}
 
-	return target.Chmod(mode)
+	err = target.Chmod(mode)
+
+	if stat, ok := e.info.Sys().(*syscall.Stat_t); ok {
+		if target.Chown(int(stat.Uid), int(stat.Gid)) == nil {
+			_ = target.Chmod(mode)
+		}
+	}
+
+	return err
 }
 
 func copyXAttrs(src, dst int) {
@@ -667,21 +708,29 @@ func copyXAttrs(src, dst int) {
 	}
 }
 
-func hasEffectiveCap(cap byte) (bool, error) {
-	const linuxCapabilityU32SizeVersion3 = 2 // _LINUX_CAPABILITY_U32S_3
+type capabilities [ /* _LINUX_CAPABILITY_U32S_3 */ 2]unix.CapUserData
 
-	pos, mask := cap/32, uint32(1)<<(cap%32)
-	if pos >= linuxCapabilityU32SizeVersion3 {
-		return false, nil
+func capabilityInEffect(cap byte) (bool, error) {
+	if caps, err := getCapabilities(); err != nil {
+		return false, err
+	} else {
+		return caps.inEffect(cap), nil
 	}
+}
 
+func getCapabilities() (*capabilities, error) {
 	hdr := unix.CapUserHeader{Version: unix.LINUX_CAPABILITY_VERSION_3}
-	var data [linuxCapabilityU32SizeVersion3]unix.CapUserData
-	if err := unix.Capget(&hdr, &data[0]); err != nil {
-		return false, os.NewSyscallError("capget", err)
+	var caps capabilities
+	if err := unix.Capget(&hdr, &caps[0]); err != nil {
+		return nil, os.NewSyscallError("capget", err)
 	}
 
-	return data[pos].Effective&mask != 0, nil
+	return &caps, nil
+}
+
+func (c *capabilities) inEffect(cap byte) bool {
+	pos, mask := cap/32, uint32(1)<<(cap%32)
+	return int(pos) < len(c) && c[pos].Effective&mask != 0
 }
 
 func outBufferSyscall(f func([]byte) (int, error)) ([]byte, error) {

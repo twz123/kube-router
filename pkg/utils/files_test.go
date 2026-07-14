@@ -2,10 +2,12 @@ package utils
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"iter"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -20,7 +22,6 @@ import (
 
 func TestWriteFileAtomically(t *testing.T) {
 	// FIXME Tests definitely need to be run with different real and effective UIDs/GIDs.
-	// FIXME how does this interact with securebits, if at all?
 	// FIXME need to run against all permutations of +sys_admin,+dac_override,+chown,+fsetid.
 	// Need to vet this against man 7 capabilities
 
@@ -42,17 +43,8 @@ func TestWriteFileAtomically(t *testing.T) {
 		return err
 	}
 
-	hasCapSysAdmin, err := hasEffectiveCap(unix.CAP_SYS_ADMIN)
+	caps, err := getCapabilities()
 	require.NoError(t, err)
-	hasCapChown, err := hasEffectiveCap(unix.CAP_CHOWN)
-	require.NoError(t, err)
-	hasCapDACOverride, err := hasEffectiveCap(unix.CAP_DAC_OVERRIDE)
-	require.NoError(t, err)
-
-	allGroups := []int{os.Getegid()}
-	suppGroups, err := os.Getgroups()
-	require.NoError(t, err)
-	allGroups = append(allGroups, suppGroups...)
 
 	t.Run("from scratch", func(t *testing.T) {
 		for mode := range allModeBitPatterns() {
@@ -65,13 +57,13 @@ func TestWriteFileAtomically(t *testing.T) {
 
 				// Record umask
 				require.NoError(t, os.WriteFile(ref, nil, 0777))
-				refStat, err := os.Stat(ref)
+				refStat, err := os.Lstat(ref)
 				require.NoError(t, err)
 				umask := 0777 &^ refStat.Mode()
 
 				require.NoError(t, expectAtomicWrite(t, true, target, nil, mode))
 
-				if info, err := os.Stat(target); assert.NoError(t, err) {
+				if info, err := os.Lstat(target); assert.NoError(t, err) {
 					if expected, actual := mode&^umask, info.Mode(); expected != actual {
 						assert.Failf(t, "Mode not equal", "expected: %s\nactual  : %s", expected, actual)
 					}
@@ -89,18 +81,158 @@ func TestWriteFileAtomically(t *testing.T) {
 		}
 	})
 
-	t.Run("from pre-existing target", func(t *testing.T) {
-		for mode := range allModeBitPatterns() {
+	t.Run("parent", func(t *testing.T) {
+		for mode := range allModeBitPatterns() { // FIXME
+			// for _, mode := range []os.FileMode{0300} { // FIXME
 			t.Run(mode.String(), func(t *testing.T) {
 				t.Parallel()
+
+				dir := t.TempDir()
+				parent := filepath.Join(dir, "parent")
+				target := filepath.Join(parent, "target")
+				from := filepath.Join(parent, "from")
+				to := filepath.Join(parent, "to")
+
+				require.NoError(t, os.Mkdir(parent, mode))
+				t.Cleanup(func() { assert.NoError(t, os.Chmod(parent, 0700)) })
+
+				// Record os.WriteFile behavior
+				var expectedMode os.FileMode
+				refErr := os.WriteFile(target, nil, 0644)
+				if refErr == nil {
+					info, err := os.Lstat(target)
+					require.NoError(t, err)
+					expectedMode = info.Mode()
+
+					if f, err := os.Open(target); err == nil {
+						require.NoError(t, f.Close())
+					}
+					require.NoError(t, os.Remove(target))
+				}
+				require.NoFileExists(t, target)
+				atomic := os.WriteFile(from, nil, 0644) == nil
+				if atomic {
+					atomic = os.Rename(from, to) == nil
+				}
+
+				err := expectAtomicWrite(t, atomic, target, nil, 0644)
+				if refErr != nil {
+					if assert.EqualErrorf(t, err, refErr.Error(), "Expected: %v", refErr) {
+						if expected, ok := errors.AsType[syscall.Errno](refErr); ok {
+							if actual, ok := errors.AsType[syscall.Errno](refErr); assert.True(t, ok, "Expected an errno") {
+								assert.Equal(t, expected, actual, "Different errno")
+							}
+						}
+					}
+					return
+				} else {
+					require.NoError(t, err)
+				}
+
+				if info, err := os.Lstat(target); assert.NoError(t, err) {
+					if actualMode := info.Mode(); expectedMode != actualMode {
+						assert.Failf(t, "Mode not equal", "expected: %s\nactual  : %s", expectedMode, actualMode)
+					}
+				}
+			})
+		}
+	})
+
+	t.Run("from pre-existing target", func(t *testing.T) {
+		euid, egid := os.Geteuid(), os.Getegid()
+
+		type testCase struct {
+			name     string
+			mode     os.FileMode
+			uid, gid int
+		}
+
+		allTestCases := func(yield func(testCase) bool) {
+			otherUID, otherGID := -1, -1
+			if caps.inEffect(unix.CAP_CHOWN) {
+				otherUID = 65534
+				if otherUID == euid {
+					otherUID--
+				}
+
+				allGroups := []int{egid}
+				suppGroups, err := os.Getgroups()
+				require.NoError(t, err)
+				allGroups = append(allGroups, suppGroups...)
+
+				for gid := 65534; gid > -1; gid-- {
+					if !slices.Contains(allGroups, gid) {
+						otherGID = gid
+						break
+					}
+				}
+			}
+
+			for mode := range allModeBitPatterns() {
+				if !yield(testCase{
+					name: mode.String(),
+					mode: mode,
+					uid:  -1, gid: -1,
+				}) {
+					return
+				}
+
+				if otherUID != -1 && !yield(testCase{
+					name: fmt.Sprintf("%s u%d", mode, otherUID),
+					mode: mode,
+					uid:  otherUID, gid: -1,
+				}) {
+					return
+				}
+
+				if otherGID != -1 && !yield(testCase{
+					name: fmt.Sprintf("%s u%d g%d", mode, otherUID, otherGID),
+					mode: mode,
+					uid:  otherUID, gid: otherGID,
+				}) {
+					return
+				}
+			}
+		}
+
+		for tc := range allTestCases {
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+
 				dir := t.TempDir()
 				target := filepath.Join(dir, "target")
-
 				attrValues := map[string][]byte{
 					"user.kube-router-test":       []byte(t.Name()),
 					"user.kube-router-test.empty": nil,
 				}
 
+				// Record os.WriteFile behavior
+				var (
+					expectedMode os.FileMode
+					canRead      bool
+				)
+				require.NoError(t, os.WriteFile(target, nil, tc.mode))
+				require.NoError(t, os.Chmod(target, tc.mode))
+				if tc.uid >= 0 || tc.gid >= 0 {
+					require.NoError(t, os.Chown(target, tc.uid, tc.gid))
+				}
+				refErr := os.WriteFile(target, nil, 0)
+				if refErr == nil {
+					info, err := os.Lstat(target)
+					require.NoError(t, err)
+					expectedMode = info.Mode()
+
+					if f, err := os.Open(target); err == nil {
+						require.NoError(t, f.Close())
+						canRead = true
+					}
+				}
+				if tc.uid >= 0 || tc.gid >= 0 {
+					require.NoError(t, os.Chown(target, euid, egid))
+				}
+				require.NoError(t, os.Remove(target))
+
+				// Now prepare the actual test.
 				require.NoError(t, os.WriteFile(target, nil, 0600))
 				for attr, val := range attrValues {
 					_, err := ignoringEINTR(func() (unit struct{}, _ error) {
@@ -109,28 +241,21 @@ func TestWriteFileAtomically(t *testing.T) {
 					})
 					require.NoError(t, err)
 				}
-				require.NoError(t, os.Chmod(target, mode|0200))
-				// Write a second time, to learn what mode bits are dropped by the kernel.
-				require.NoError(t, os.WriteFile(target, nil, 0))
-				// Record the actual file info as a result of open(..., O_WRONLY|O_TRUNC, ...).
-				info, err := os.Lstat(target)
-				require.NoError(t, err)
-				// Restore the mode to test.
-				require.NoError(t, os.Chmod(target, mode))
-				expectedMode := info.Mode()
-				if mode&0200 == 0 {
-					expectedMode &^= 0200
+				require.NoError(t, os.Chmod(target, tc.mode))
+				if tc.uid >= 0 || tc.gid >= 0 {
+					require.NoError(t, os.Chown(target, tc.uid, tc.gid))
 				}
 
-				ruid, euid := os.Getuid(), os.Geteuid()
-				_, _ = ruid, euid
-				err = expectAtomicWrite(t, true, target, []byte(mode.String()), 0)
-				if !hasCapDACOverride && mode&0200 == 0 {
-					var pathErr *os.PathError
-					require.ErrorAs(t, err, &pathErr)
-					assert.Equal(t, "open", pathErr.Op)
-					assert.Equal(t, target, pathErr.Path)
-					assert.ErrorIs(t, pathErr.Err, syscall.EACCES)
+				err := expectAtomicWrite(t, true, target, []byte("written"), 0)
+				if refErr != nil {
+					if assert.EqualErrorf(t, err, refErr.Error(), "Expected: %v", refErr) {
+						if expected, ok := errors.AsType[syscall.Errno](refErr); ok {
+							if actual, ok := errors.AsType[syscall.Errno](refErr); assert.True(t, ok, "Expected an errno") {
+								assert.Equal(t, expected, actual, "Different errno")
+							}
+						}
+					}
+
 					return
 				}
 				require.NoError(t, err)
@@ -140,26 +265,26 @@ func TestWriteFileAtomically(t *testing.T) {
 				if actualMode := actualInfo.Mode(); expectedMode != actualMode {
 					assert.Failf(t, "Mode not equal", "expected: %s\nactual  : %s", expectedMode, actualMode)
 				}
-				if actualInfo.Mode().Perm()&0400 == 0 {
-					require.NoError(t, os.Chmod(target, actualInfo.Mode()|0400), "Failed to restore permissions")
-				} else {
-					// FIXME: Only verify the extended attributes if the
-					// target file is readable. The process can't read
-					// them, so they can't be copied.
-					for attr, expected := range attrValues {
-						actual, err := outBufferSyscall(func(buf []byte) (int, error) {
-							return ignoringEINTR(func() (int, error) {
-								return unix.Getxattr(target, attr, buf)
-							})
+
+				for attr, expected := range attrValues {
+					actual, err := outBufferSyscall(func(buf []byte) (int, error) {
+						return ignoringEINTR(func() (int, error) {
+							return unix.Getxattr(target, attr, buf)
 						})
+					})
+					if canRead {
 						if assert.NoErrorf(t, err, "While getting %s", attr) {
 							assert.Equalf(t, expected, actual, "While comparing %s", attr)
 						}
+					} else {
+						assert.ErrorIs(t, err, syscall.EACCES)
 					}
 				}
 
-				if content, err := readFileNoFollow(target); assert.NoError(t, err) {
-					assert.Equal(t, []byte(mode.String()), content)
+				if canRead {
+					if content, err := readFileNoFollow(target); assert.NoError(t, err) {
+						assert.Equal(t, []byte("written"), content)
+					}
 				}
 			})
 		}
@@ -200,7 +325,6 @@ func TestWriteFileAtomically(t *testing.T) {
 		var pathErr *os.PathError
 		if assert.ErrorAs(t, err, &pathErr) {
 			assert.Equal(t, "open", pathErr.Op)
-			// assert.Equal(t, filepath.Clean(filepath.Dir(target)), filepath.Clean(pathErr.Path))
 			assert.Equal(t, target, pathErr.Path)
 			assert.ErrorIs(t, pathErr.Err, os.ErrNotExist)
 		}
@@ -341,7 +465,7 @@ func TestWriteFileAtomically(t *testing.T) {
 		})
 
 		t.Run("refuses to follow foreign symlinks", func(t *testing.T) {
-			if !hasCapChown {
+			if !caps.inEffect(unix.CAP_CHOWN) {
 				t.Skipf("Need CAP_CHOWN for this test.")
 			}
 
@@ -452,7 +576,7 @@ func TestWriteFileAtomically(t *testing.T) {
 	})
 
 	t.Run("bind mounted target file", func(t *testing.T) {
-		if !hasCapSysAdmin {
+		if !caps.inEffect(unix.CAP_SYS_ADMIN) {
 			t.Skipf("Need CAP_SYS_ADMIN for this test.")
 		}
 
@@ -483,7 +607,7 @@ func TestWriteFileAtomically(t *testing.T) {
 	})
 
 	t.Run("bind mounted target symlink", func(t *testing.T) {
-		if !hasCapSysAdmin {
+		if !caps.inEffect(unix.CAP_SYS_ADMIN) {
 			t.Skipf("Need CAP_SYS_ADMIN for this test.")
 		}
 
